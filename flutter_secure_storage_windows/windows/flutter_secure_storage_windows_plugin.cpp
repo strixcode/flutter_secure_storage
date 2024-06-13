@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <direct.h>
 #include <bcrypt.h>
+#include <dpapi.h>
 
 // For getPlatformVersion; remove unless needed for your plugin implementation.
 #include <VersionHelpers.h>
@@ -30,6 +31,16 @@
 
 namespace
 {
+    // Prefix to mark errors returned as value.
+    const std::string k_ErrorValuePrefix = "<FSSWE>";
+
+    const size_t KEY_SIZE = 16;
+
+#ifdef USE_CRYPT_PROTECT_DATA
+    const BYTE k_entropyBytes[] = {1, 2, 3, 4, 0, 9, 8, 7, 12, 13}; // just random bytes
+#else
+    const BYTE k_QliqChatKey[] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef }; // 16 bytes key for AES-128
+#endif
 
   class FlutterSecureStorageWindowsPlugin : public flutter::Plugin
   {
@@ -75,10 +86,21 @@ namespace
 
     PBYTE GetEncryptionKey();
 
+    PBYTE GetEncryptionKeyFromFile();
+
+    void WriteEncryptionKeyToFile(PBYTE AesKey);
+
+    // This method is for debugging purposes only.
+    void WritePlainTextKeyToFile(PBYTE AesKey, const std::wstring& fileName);
+
     // Stores the given value under the given key.
     void Write(const std::string &key, const std::string &val);
 
+    void Write(const std::string &key, const std::string &val, const PBYTE encryptionKey, bool freeKey);
+
     std::optional<std::string> Read(const std::string &key);
+
+    std::optional<std::string> Read(const std::string &key, const PBYTE encryptionKey, bool freeKey);
 
     flutter::EncodableMap ReadAll();
 
@@ -239,20 +261,8 @@ namespace
               if (VerQueryValue(infoBuffer, TEXT("\\StringFileInfo\\040904e4\\CompanyName"), &queryVal, &queryLen) != 0) {
                   companyName = SanitizeDirString(std::wstring((const TCHAR*)queryVal));
               }
-              else if (VerQueryValue(infoBuffer, TEXT("\\StringFileInfo\\040904b0\\CompanyName"), &queryVal, &queryLen) != 0) {
-                  companyName = SanitizeDirString(std::wstring((const TCHAR*)queryVal));
-              }
-              else {
-                  companyName = L"placeholder_company";
-              }
               if (VerQueryValue(infoBuffer, TEXT("\\StringFileInfo\\040904e4\\ProductName"), &queryVal, &queryLen) != 0) {
                   productName = SanitizeDirString(std::wstring((const TCHAR*)queryVal));
-              }
-              else if (VerQueryValue(infoBuffer, TEXT("\\StringFileInfo\\040904b0\\ProductName"), &queryVal, &queryLen) != 0) {
-                  productName = SanitizeDirString(std::wstring((const TCHAR*)queryVal));
-              }
-              else {
-                  productName = L"placeholder_product";
               }
           }
           stream << appdataPath << "\\" << companyName << "\\" << productName;
@@ -267,14 +277,10 @@ namespace
 
   std::wstring FlutterSecureStorageWindowsPlugin::SanitizeDirString(std::wstring string)
   {
-      std::wstring illegalChars = L"\\/:?\"<>|";
-      for (auto it = string.begin(); it < string.end(); ++it) {
-          if (illegalChars.find(*it) != std::wstring::npos) {
-              *it = L'_';
-          }
-      }
-      rtrim(string);
-      return string;
+      std::wstring sanitizedString = std::regex_replace(string,std::wregex(L"[<>:\"/\\\\|?*]"),L"_");
+      rtrim(sanitizedString);
+      sanitizedString = std::regex_replace(sanitizedString, std::wregex(L"[.]+$"), L"");
+      return sanitizedString;
   }
 
   bool FlutterSecureStorageWindowsPlugin::PathExists(const std::wstring& path)
@@ -311,11 +317,87 @@ namespace
       }
   }
 
+  PBYTE FlutterSecureStorageWindowsPlugin::GetEncryptionKeyFromFile()
+  {
+    std::optional<std::string> key = Read(SECURE_STORAGE_KEY_PREFIX "storage.key", (PBYTE)k_QliqChatKey, false);
+    if (key.has_value())
+    {
+        PBYTE fileBuffer = (PBYTE)HeapAlloc(GetProcessHeap(), 0, key.value().size());
+        memcpy(fileBuffer, key.value().c_str(), key.value().size());
+      return fileBuffer;
+    }
+    return nullptr;
+  }
+
+  void FlutterSecureStorageWindowsPlugin::WriteEncryptionKeyToFile(PBYTE AesKey)
+  {
+#ifdef USE_CRYPT_PROTECT_DATA
+    bool encryptionOk = false;
+    PBYTE encryptedDataPtr = nullptr;
+    std::size_t encryptedDataSize = 0;
+
+    DATA_BLOB entropyData;
+    entropyData.pbData = (BYTE *) k_entropyBytes;
+    entropyData.cbData = sizeof(k_entropyBytes);
+
+    DATA_BLOB plainData, encryptedData;
+    plainData.pbData = AesKey;
+    plainData.cbData = KEY_SIZE;
+
+    encryptionOk = CryptProtectData(&plainData, L"x", &entropyData, NULL, NULL, CRYPTPROTECT_LOCAL_MACHINE, &encryptedData);
+    if (encryptionOk) {
+        encryptedDataSize = encryptedData.cbData;
+        encryptedDataPtr = encryptedData.pbData;
+    } else {
+        std::cerr << "Failed to encrypt key" << std::endl;
+        return;
+    }
+
+    std::wstring appSupportPath;
+    GetApplicationSupportPath(appSupportPath);
+    if (!PathExists(appSupportPath)) {
+        MakePath(appSupportPath);
+    }
+
+    std::basic_ofstream<BYTE> fs = std::basic_ofstream<BYTE>(appSupportPath + L"\\" SECURE_STORAGE_KEY_PREFIX "storage.key", std::ios::binary | std::ios::trunc);
+    if (!fs) {
+        std::cerr << "Failed to open output stream" << std::endl;
+        return;
+    }
+    fs.write(encryptedDataPtr, encryptedDataSize);
+    fs.close();
+
+    LocalFree(encryptedData.pbData);
+#else
+    Write(SECURE_STORAGE_KEY_PREFIX "storage.key", std::string((char*)AesKey, KEY_SIZE), (PBYTE)k_QliqChatKey, false);
+#endif
+}
+
+   void FlutterSecureStorageWindowsPlugin::WritePlainTextKeyToFile(PBYTE AesKey, const std::wstring& fileName)
+    {
+        std::wstring appSupportPath;
+        GetApplicationSupportPath(appSupportPath);
+        if (!PathExists(appSupportPath)) {
+            MakePath(appSupportPath);
+        }
+        std::basic_ofstream<BYTE> fs = std::basic_ofstream<BYTE>(appSupportPath + L"\\" SECURE_STORAGE_KEY_PREFIX + fileName, std::ios::binary | std::ios::trunc);
+        if (!fs) {
+            std::cerr << "Failed to open output stream" << std::endl;
+            return;
+        }
+        fs.write(AesKey, KEY_SIZE);
+        fs.close();
+    }
+
+
   PBYTE FlutterSecureStorageWindowsPlugin::GetEncryptionKey()
   {
-      const size_t KEY_SIZE = 16;
+        PBYTE AesKey = GetEncryptionKeyFromFile();
+        if (AesKey != nullptr) {
+            return AesKey;
+        }
+
       DWORD credError = 0;
-      PBYTE AesKey;
       PCREDENTIALW pcred;
       CA2W target_name(("key_" + ELEMENT_PREFERENCES_KEY_PREFIX).c_str());
 
@@ -333,6 +415,9 @@ namespace
           }
           memcpy(AesKey, pcred->CredentialBlob, KEY_SIZE);
           CredFree(pcred);
+          WriteEncryptionKeyToFile(AesKey);
+          // For debugging only
+          // WritePlainTextKeyToFile(AesKey, L"storage_plain.key");
           return AesKey;
       }
       credError = GetLastError();
@@ -343,6 +428,11 @@ namespace
       if (BCryptGenRandom(NULL, AesKey, KEY_SIZE, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != ERROR_SUCCESS) {
           return NULL;
       }
+
+    WriteEncryptionKeyToFile(AesKey);
+    // For debugging only
+    // WritePlainTextKeyToFile(AesKey, L"storage_plain.key");
+
       CREDENTIALW cred = { 0 };
       cred.Type = CRED_TYPE_GENERIC;
       cred.TargetName = target_name.m_psz;
@@ -452,11 +542,10 @@ namespace
     }
   }
 
-  void FlutterSecureStorageWindowsPlugin::Write(const std::string &key, const std::string &val)
-  {
+void FlutterSecureStorageWindowsPlugin::Write(const std::string &key, const std::string &val, const PBYTE encryptionKey, bool freeKey)
+{
       //The recommended size for AES-GCM IV is 12 bytes
       const DWORD NONCE_SIZE = 12;
-      const DWORD KEY_SIZE = 16;
 
       NTSTATUS status;
       BCRYPT_ALG_HANDLE algo = NULL;
@@ -464,8 +553,7 @@ namespace
       DWORD bytesWritten = 0,
           ciphertextSize = 0;
       PBYTE ciphertext = NULL,
-          iv = (PBYTE)HeapAlloc(GetProcessHeap(), 0, NONCE_SIZE),
-          encryptionKey = GetEncryptionKey();
+          iv = (PBYTE)HeapAlloc(GetProcessHeap(), 0, NONCE_SIZE);
       BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo{};
       BCRYPT_AUTH_TAG_LENGTHS_STRUCT authTagLengths{};
       std::basic_ofstream<BYTE> fs;
@@ -546,7 +634,7 @@ namespace
       if (!PathExists(appSupportPath)) {
           MakePath(appSupportPath);
       }
-      fs = std::basic_ofstream<BYTE>(appSupportPath + L"\\" + std::wstring(key.begin(), key.end()) + L".secure", std::ios::binary | std::ios::trunc);
+      fs = std::basic_ofstream<BYTE>(appSupportPath + L"\\" + std::wstring(key.begin(), key.end()) + (freeKey ? L".secure" : L".key"), std::ios::binary | std::ios::trunc);
       if (!fs) {
           error = "Failed to open output stream";
           goto err;
@@ -556,7 +644,9 @@ namespace
       fs.write(ciphertext, ciphertextSize);
       fs.close();
       HeapFree(GetProcessHeap(), 0, iv);
-      HeapFree(GetProcessHeap(), 0, encryptionKey);
+      if (freeKey) {
+          HeapFree(GetProcessHeap(), 0, encryptionKey);
+      }
       HeapFree(GetProcessHeap(), 0, authInfo.pbNonce);
       HeapFree(GetProcessHeap(), 0, authInfo.pbTag);
       HeapFree(GetProcessHeap(), 0, ciphertext);
@@ -565,7 +655,7 @@ namespace
       if (iv) {
           HeapFree(GetProcessHeap(), 0, iv);
       }
-      if (encryptionKey) {
+      if (encryptionKey && freeKey) {
           HeapFree(GetProcessHeap(), 0, encryptionKey);
       }
       if (authInfo.pbNonce) {
@@ -578,21 +668,29 @@ namespace
           HeapFree(GetProcessHeap(), 0, ciphertext);
       }
       throw std::runtime_error(error);
+}
+  void FlutterSecureStorageWindowsPlugin::Write(const std::string &key, const std::string &val)
+  {
+      return Write(key, val, GetEncryptionKey(), true);
   }
 
   std::optional<std::string> FlutterSecureStorageWindowsPlugin::Read(const std::string &key)
   {
+    return Read(key, GetEncryptionKey(), true);
+  }
+
+  std::optional<std::string> FlutterSecureStorageWindowsPlugin::Read(const std::string &key, const PBYTE encryptionKey, bool freeKey)
+  {
       const DWORD NONCE_SIZE = 12;
-      const DWORD KEY_SIZE = 16;
 
       NTSTATUS status;
       BCRYPT_ALG_HANDLE algo = NULL;
       BCRYPT_KEY_HANDLE keyHandle = NULL;
       BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo{};
       BCRYPT_AUTH_TAG_LENGTHS_STRUCT authTagLengths{};
+      std::string errorMessage;
 
-      PBYTE encryptionKey = GetEncryptionKey(),
-          ciphertext = NULL,
+      PBYTE ciphertext = NULL,
           fileBuffer = NULL,
           plaintext = NULL;
       DWORD plaintextSize = 0,
@@ -605,6 +703,7 @@ namespace
 
       if (encryptionKey == NULL) {
           std::cerr << "encryptionKey is NULL" << std::endl;
+          errorMessage = "encryptionKey is NULL";
           goto cleanup;
       }
       GetApplicationSupportPath(appSupportPath);
@@ -612,7 +711,7 @@ namespace
           MakePath(appSupportPath);
       }
       //Read full file into a buffer
-      fs = std::basic_ifstream<BYTE>(appSupportPath + L"\\" + std::wstring(key.begin(), key.end()) + L".secure", std::ios::binary);
+      fs = std::basic_ifstream<BYTE>(appSupportPath + L"\\" + std::wstring(key.begin(), key.end()) + (freeKey ? L".secure" : L".key"), std::ios::binary);
       if (!fs.good()) {
           //Backwards comp.
           PCREDENTIALW pcred;
@@ -623,6 +722,10 @@ namespace
               auto val = std::string((char*)pcred->CredentialBlob);
               CredFree(pcred);
               returnVal = val;
+              errorMessage = "Used backward compatible method, got value: " + val;
+          }
+          else {
+              //errorMessage = "Could not read file " << appSupportPath + "\\" + std::wstring(key.begin(), key.end()) + ".secure";
           }
           goto cleanup;
       }
@@ -633,6 +736,7 @@ namespace
       fileBuffer = (PBYTE)HeapAlloc(GetProcessHeap(), 0, fileSize);
       if (NULL == fileBuffer) {
           std::cerr << "fileBuffer HeapAlloc failed" << std::endl;
+          errorMessage = "fileBuffer HeapAlloc failed";
           goto cleanup;
       }
       fs.read(fileBuffer, fileSize);
@@ -641,16 +745,19 @@ namespace
       status = BCryptOpenAlgorithmProvider(&algo, BCRYPT_AES_ALGORITHM, NULL, 0);
       if (!BCRYPT_SUCCESS(status)) {
           std::cerr << NtStatusToString("BCryptOpenAlgorithmProvider", status) << std::endl;
+          errorMessage = NtStatusToString("BCryptOpenAlgorithmProvider", status);
           goto cleanup;
       }
       status = BCryptSetProperty(algo, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
       if (!BCRYPT_SUCCESS(status)) {
           std::cerr << NtStatusToString("BCryptOpenAlgorithmProvider", status) << std::endl;
+          errorMessage = NtStatusToString("BCryptOpenAlgorithmProvider", status);
           goto cleanup;
       }
       status = BCryptGetProperty(algo, BCRYPT_AUTH_TAG_LENGTH, (PBYTE)&authTagLengths, sizeof(BCRYPT_AUTH_TAG_LENGTHS_STRUCT), &bytesWritten, 0);
       if (!BCRYPT_SUCCESS(status)) {
           std::cerr << NtStatusToString("BCryptGetProperty", status) << std::endl;
+          errorMessage = NtStatusToString("BCryptGetProperty", status);
           goto cleanup;
       }
 
@@ -658,23 +765,27 @@ namespace
       authInfo.pbNonce = (PUCHAR)HeapAlloc(GetProcessHeap(), 0, NONCE_SIZE);
       if (authInfo.pbNonce == NULL) {
           std::cerr << "pbNonce HeapAlloc Failed" << std::endl;
+          errorMessage = "pbNonce HeapAlloc Failed";
           goto cleanup;
       }
       authInfo.cbNonce = NONCE_SIZE;
       //Check if file is at least long enough for iv and authentication tag
       if (fileSize <= static_cast<long long>(NONCE_SIZE) + authTagLengths.dwMaxLength) {
           std::cerr << "File is too small" << std::endl;
+          errorMessage = "File is too small";
           goto cleanup;
       }
       authInfo.pbTag = (PUCHAR)HeapAlloc(GetProcessHeap(), 0, authTagLengths.dwMaxLength);
       if (authInfo.pbTag == NULL) {
           std::cerr << "pbTag HeapAlloc Failed" << std::endl;
+          errorMessage = "pbTag HeapAlloc Failed";
           goto cleanup;
       }
       ciphertextSize = (DWORD)fileSize - NONCE_SIZE - authTagLengths.dwMaxLength;
       ciphertext = (PBYTE)HeapAlloc(GetProcessHeap(), 0, ciphertextSize);
       if (ciphertext == NULL) {
           std::cerr << "ciphertext HeapAlloc failed" << std::endl;
+          errorMessage = "ciphertext HeapAlloc failed";
           goto cleanup;
       }
       //Copy different parts needed for decryption from filebuffer
@@ -689,29 +800,33 @@ namespace
       status = BCryptGenerateSymmetricKey(algo, &keyHandle, NULL, 0, encryptionKey, KEY_SIZE, 0);
       if (!BCRYPT_SUCCESS(status)) {
           std::cerr << NtStatusToString("BCryptGenerateSymmetricKey", status) << std::endl;
+          errorMessage = NtStatusToString("BCryptGenerateSymmetricKey", status);
           goto cleanup;
       }
       //First call is to determine size of plaintext
       status = BCryptDecrypt(keyHandle, ciphertext, ciphertextSize, (PVOID)&authInfo, NULL, 0, NULL, 0, &bytesWritten, 0);
       if (!BCRYPT_SUCCESS(status)) {
           std::cerr << NtStatusToString("BCryptDecrypt1", status) << std::endl;
+          errorMessage = NtStatusToString("BCryptDecrypt1", status);
           goto cleanup;
       }
       plaintextSize = bytesWritten;
       plaintext = (PBYTE)HeapAlloc(GetProcessHeap(), 0, plaintextSize);
       if (NULL == plaintext) {
           std::cerr << "plaintext HeapAlloc failed" << std::endl;
+          errorMessage = "plaintext HeapAlloc failed";
           goto cleanup;
       }
       //Actuual decryption
       status = BCryptDecrypt(keyHandle, ciphertext, ciphertextSize, (PVOID)&authInfo, NULL, 0, plaintext, plaintextSize, &bytesWritten, 0);
       if (!BCRYPT_SUCCESS(status)) {
           std::cerr << NtStatusToString("BCryptDecrypt2", status) << std::endl;
+          errorMessage = NtStatusToString("BCryptDecrypt2", status);
           goto cleanup;
       }
       returnVal = (char*)plaintext;
   cleanup:
-      if (encryptionKey) {
+      if (encryptionKey && freeKey) {
           HeapFree(GetProcessHeap(), 0, encryptionKey);
       }
       if (ciphertext) {
@@ -728,6 +843,9 @@ namespace
       }
       if (authInfo.pbTag) {
           HeapFree(GetProcessHeap(), 0, authInfo.pbTag);
+      }
+      if (!errorMessage.empty()) {
+          returnVal = k_ErrorValuePrefix + errorMessage;
       }
       return returnVal;
   }
@@ -755,12 +873,14 @@ namespace
           fileName.erase(pos, 7);
           char* out = new char[fileName.length() + 1];
           size_t charsConverted = 0;
-          wcstombs_s(&charsConverted, out, fileName.length() + 1, fileName.c_str(), fileName.length() + 1);
-          std::optional<std::string> val = this->Read(out);
-          auto key = this->RemoveKeyPrefix(out);
-          if (val.has_value()) {
-              creds[key] = val.value();
-              continue;
+          int error = wcstombs_s(&charsConverted, out, fileName.length() + 1, fileName.c_str(), fileName.length() + 1);
+          if (error == 0) {
+              std::optional<std::string> val = this->Read(out);
+              auto key = this->RemoveKeyPrefix(out);
+              if (val.has_value()) {
+                  creds[key] = val.value();
+                  continue;
+              }
           }
       } while (FindNextFile(hFile, &searchRes) != 0);
 
@@ -798,7 +918,7 @@ namespace
       BOOL ok = DeleteFile((appSupportPath + L"\\" + wstr + L".secure").c_str());
       if (!ok) {
           DWORD error = GetLastError();
-          if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+          if (error != ERROR_FILE_NOT_FOUND) {
               throw error;
           }
       }
